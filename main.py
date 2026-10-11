@@ -8,6 +8,8 @@ from bs4 import BeautifulSoup
 from flask import Flask, jsonify, request
 
 app = Flask(__name__)
+setattr(app.json, "sort_keys", False)
+setattr(app.json, "ensure_ascii", False)
 MODEL_NAME = "gemini-web"
 CORS = {
     "Access-Control-Allow-Origin": "*",
