@@ -1,56 +1,230 @@
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
-import google.generativeai as genai
+import json
+import re
+import time
+import uuid
+from datetime import datetime, timezone
 
-app = FastAPI()
+import requests
+from bs4 import BeautifulSoup
+from flask import Flask, jsonify, request
 
-@app.get("/")
-async def root():
+app = Flask(__name__)
+MODEL_NAME = "gemini-web"
+
+
+class GeminiSessionError(RuntimeError):
+    pass
+
+
+def extract_token(html: str):
+    patterns = [
+        r'"SNlM0e":"([^"]+)"',
+        r"'SNlM0e':'([^']+)'",
+        r'SNlM0e["\']?\s*[:=]\s*["\']([^"\']+)',
+        r'"FdrFJe":"([^"]+)"',
+        r'"cfb2h":"([^"]+)"',
+        r'"at":"([^"]+)"',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, html, re.IGNORECASE)
+        if match and len(match.group(1)) > 20:
+            return match.group(1)
+
+    soup = BeautifulSoup(html, "html.parser")
+    for script in soup.find_all("script"):
+        content = script.string or script.get_text()
+        if any(key in content for key in ("SNlM0e", "FdrFJe", "cfb2h")):
+            for pattern in patterns:
+                match = re.search(pattern, content, re.IGNORECASE)
+                if match and len(match.group(1)) > 20:
+                    return match.group(1)
+    return None
+
+
+def extract_params(html: str):
+    def first(patterns, default=None):
+        for pattern in patterns:
+            match = re.search(pattern, html, re.IGNORECASE)
+            if match:
+                return match.group(1)
+        return default
+
     return {
-        "status": "online",
-        "message": "API de Gemini funcionando",
-        "developer": "El Impaciente",
-        "endpoint": "/gemini?key=YOUR_KEY&text=YOUR_QUERY"
+        "bl": first([
+            r'bl["\']?\s*[:=]\s*["\']([^"\']+)',
+            r'buildLabel["\']?\s*[:=]\s*["\']([^"\']+)',
+        ], "boq_assistant-bard-web-server_20251231.00_p0"),
+        "fsid": first([
+            r'f\.sid["\']?\s*[:=]\s*["\']?([^"\'\s&]+)',
+            r'"fsid":"([^"]+)"',
+        ], str(-int(time.time() * 1000))),
+        "reqid": int(first([r'_reqid["\']?\s*[:=]\s*["\']?(\d+)'], str(int(time.time() * 1000) % 1_000_000))),
     }
 
-@app.get("/gemini")
-async def gemini_query(key: str = None, text: str = None):
-    # Validar que ambos parámetros estén presentes
-    if not key or not text:
-        return JSONResponse(
-            content={
-                "status_code": 400,
-                "developer": "El Impaciente",
-                "message": "Se requieren los parámetros key y text"
-            },
-            status_code=400
-        )
-    
+
+def create_session():
+    session = requests.Session()
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; GemChat/1.0)",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    page = session.get("https://gemini.google.com/app", headers=headers, timeout=30)
+    page.raise_for_status()
+    token = extract_token(page.text)
+    if not token:
+        raise GeminiSessionError("No se encontró el token de sesión de Gemini")
+    params = extract_params(page.text)
+    return session, token, params
+
+
+def build_payload(prompt, token):
+    prompt_esc = prompt.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+    session_id = uuid.uuid4().hex
+    request_id = str(uuid.uuid4()).upper()
+    data = [
+        [prompt_esc, 0, None, None, None, None, 0],
+        ["en-US"],
+        ["", "", "", None, None, None, None, None, None, ""],
+        token,
+        session_id,
+        None,
+        [0],
+        1,
+        None,
+        None,
+        1,
+        0,
+        None,
+        None,
+        None,
+        None,
+        None,
+        [[0]],
+        0,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        1,
+        None,
+        None,
+        [4],
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        [2],
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        0,
+        None,
+        None,
+        None,
+        None,
+        None,
+        request_id,
+        None,
+        []
+    ]
+    payload_str = json.dumps(data, separators=(",", ":"))
+    esc_payload = payload_str.replace("\\", "\\\\").replace('"', '\\"')
+    return {"f.req": f'[null,"{esc_payload}"]', "": ""}
+
+def parse_response(text: str):
+    answer = ""
+    for line in text.strip().splitlines():
+        if not line or line.startswith(")]}") or line.isdigit():
+            continue
+        try:
+            outer = json.loads(line)
+            if not isinstance(outer, list) or not outer or outer[0][0] != "wrb.fr":
+                continue
+            inner = outer[0][2]
+            parsed = json.loads(inner)
+            if len(parsed) <= 4 or not isinstance(parsed[4], list) or not parsed[4]:
+                continue
+            item = parsed[4][0]
+            if isinstance(item, list) and len(item) > 1 and isinstance(item[1], list):
+                candidate = item[1][0] if item[1] else ""
+                if isinstance(candidate, str) and len(candidate) > len(answer):
+                    answer = candidate
+        except (ValueError, IndexError, KeyError, TypeError):
+            continue
+    return answer.replace("\\n", "\n").replace('\\"', '"').replace("\\\\", "\\") or None
+
+
+def ask_gemini(prompt: str):
+    session, token, params = create_session()
+    url = (
+        "https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/"
+        f"StreamGenerate?bl={params['bl']}&f.sid={params['fsid']}&hl=en-US&"
+        f"_reqid={params['reqid']}&rt=c"
+    )
+    cookies = "; ".join(f"{key}={value}" for key, value in session.cookies.items())
+    response = session.post(
+        url,
+        data=build_payload(prompt, token),
+        headers={
+            "User-Agent": "Mozilla/5.0 (compatible; GemChat/1.0)",
+            "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+            "Origin": "https://gemini.google.com",
+            "Referer": "https://gemini.google.com/",
+            "X-Same-Domain": "1",
+            "Cookie": cookies,
+        },
+        timeout=60,
+    )
+    response.raise_for_status()
+    answer = parse_response(response.text)
+    if not answer:
+        raise GeminiSessionError("Gemini no devolvió una respuesta interpretable")
+    return answer
+
+
+@app.get("/api/health")
+def health():
+    return {"ok": True, "model": MODEL_NAME, "service": "GemChat"}
+
+
+@app.post("/api/chat")
+def chat():
+    payload = request.get_json(silent=True) or {}
+    prompt = str(payload.get("message", payload.get("prompt", ""))).strip()
+    if not prompt:
+        return jsonify({"success": False, "error": "El campo message es obligatorio"}), 400
+    if len(prompt) > 8_000:
+        return jsonify({"success": False, "error": "El mensaje es demasiado largo"}), 413
+    started = time.time()
     try:
-        # Configurar Gemini con la API key
-        genai.configure(api_key=key)
-        
-        # Usar el modelo Gemini 2.5 Flash-Lite
-        model = genai.GenerativeModel('gemini-2.5-flash-lite')
-        
-        # Generar respuesta
-        response = model.generate_content(text)
-        
-        return JSONResponse(
-            content={
-                "status_code": 200,
-                "developer": "El Impaciente",
-                "message": response.text
+        answer = ask_gemini(prompt)
+        return jsonify({
+            "success": True,
+            "response": answer,
+            "model": MODEL_NAME,
+            "metadata": {
+                "response_time": round(time.time() - started, 2),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
             },
-            status_code=200
-        )
-        
-    except Exception as e:
-        return JSONResponse(
-            content={
-                "status_code": 400,
-                "developer": "El Impaciente",
-                "message": f"Error: {str(e)}"
-            },
-            status_code=400
-        )
+        })
+    except Exception as exc:
+        return jsonify({"success": False, "error": str(exc), "model": MODEL_NAME}), 502
