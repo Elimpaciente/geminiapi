@@ -10,6 +10,11 @@ from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 MODEL_NAME = "gemini-web"
+CORS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+}
 
 
 class GeminiSessionError(RuntimeError):
@@ -201,23 +206,31 @@ def ask_gemini(prompt: str):
     return answer
 
 
-@app.get("/api/health")
+def json_response(data, status=200):
+    response = jsonify(data)
+    response.status_code = status
+    response.headers.update(CORS)
+    return response
+
+
+@app.get("/health")
 def health():
-    return {"ok": True, "model": MODEL_NAME, "service": "GemChat"}
+    return json_response({"ok": True, "model": MODEL_NAME, "service": "GemChat"})
 
 
-@app.post("/api/chat")
+@app.route("/chat", methods=["GET", "OPTIONS"])
 def chat():
-    payload = request.get_json(silent=True) or {}
-    prompt = str(payload.get("message", payload.get("prompt", ""))).strip()
+    if request.method == "OPTIONS":
+        return json_response({}, 204)
+    prompt = request.args.get("prompt", "").strip()
     if not prompt:
-        return jsonify({"success": False, "error": "El campo message es obligatorio"}), 400
+        return json_response({"success": False, "message": "Prompt parameter required"}, 400)
     if len(prompt) > 8_000:
-        return jsonify({"success": False, "error": "El mensaje es demasiado largo"}), 413
+        return json_response({"success": False, "message": "Prompt is too long"}, 413)
     started = time.time()
     try:
         answer = ask_gemini(prompt)
-        return jsonify({
+        return json_response({
             "success": True,
             "response": answer,
             "model": MODEL_NAME,
@@ -226,5 +239,5 @@ def chat():
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             },
         })
-    except Exception as exc:
-        return jsonify({"success": False, "error": str(exc), "model": MODEL_NAME}), 502
+    except Exception:
+        return json_response({"success": False, "message": "Error processing request"}, 400)
