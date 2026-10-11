@@ -2,7 +2,6 @@ import json
 import re
 import time
 import uuid
-from datetime import datetime, timezone
 
 import requests
 from bs4 import BeautifulSoup
@@ -227,17 +226,11 @@ def chat():
         return json_response({"success": False, "message": "Prompt parameter required"}, 400)
     if len(prompt) > 8_000:
         return json_response({"success": False, "message": "Prompt is too long"}, 413)
-    started = time.time()
     try:
         answer = ask_gemini(prompt)
         return json_response({
             "success": True,
             "response": answer,
-            "model": MODEL_NAME,
-            "metadata": {
-                "response_time": round(time.time() - started, 2),
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            },
         })
     except Exception:
         return json_response({"success": False, "message": "Error processing request"}, 400)
